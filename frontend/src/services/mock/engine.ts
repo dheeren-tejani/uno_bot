@@ -64,6 +64,7 @@ export function createEngine(difficulty: Difficulty): Engine {
     phase: 0, drawnCard: null, actions: 0,
     status: 'playing', winner: null, legal: [],
     startedAt: Date.now(), events: [], frames: [],
+    duration: 0,
   };
   st.legal = computeLegal(st);
   emit(st, {
@@ -110,10 +111,6 @@ function finish(st: Engine, winner: 0 | 1 | -1) {
   st.legal = [];
   st.duration = (Date.now() - st.startedAt) / 1000;
 }
-// small augment for finish()
-declare module './engine' {}
-interface EngineExtra { duration?: number }
-(Object.prototype as any); // (no-op guard, see finishSave below)
 
 function saveReplayLocal(st: Engine, code: string) {
   try {
