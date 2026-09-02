@@ -10,6 +10,7 @@ import time
 import gc
 import argparse
 from typing import Optional
+from collections import deque
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -104,7 +105,7 @@ def main(cfg: Optional[TrainingConfig] = None):
         device=cfg.hardware.device
     )
 
-    # === PINNED MEMORY BUFFERS (async CPU↔GPU) ===
+    # === PINNED MEMORY BUFFERS (async CPU<->GPU) ===
     obs_pinned = torch.empty(cfg.env.num_envs, cfg.env.obs_dim,
                              dtype=torch.float32, pin_memory=True)
     mask_pinned = torch.empty(cfg.env.num_envs, cfg.cards.num_actions,
@@ -121,6 +122,9 @@ def main(cfg: Optional[TrainingConfig] = None):
                                   dtype=torch.float32, pin_memory=True)
     act_pinned = torch.empty(cfg.env.num_envs, dtype=torch.int64, pin_memory=True)
     opp_act_pinned = torch.empty(cfg.env.num_envs, dtype=torch.int64, pin_memory=True)
+    # T4: pinned buffers for rewards/dones H2D
+    reward_pinned = torch.empty(cfg.env.num_envs, dtype=torch.float32, pin_memory=True)
+    done_pinned = torch.empty(cfg.env.num_envs, dtype=torch.bool, pin_memory=True)
 
     # === INITIAL RESET ===
     obs_np, mask_np, hist_np = env.reset()
@@ -134,10 +138,13 @@ def main(cfg: Optional[TrainingConfig] = None):
     agent_hidden = torch.zeros(1, cfg.env.num_envs, cfg.model.core_gru_dim, device=device)
     opp_hidden = torch.zeros(1, cfg.env.num_envs, cfg.model.core_gru_dim, device=device)
 
-    league.add_snapshot(agent_net, iteration=0, save_dir=cfg.logging.league_dir)
+    # B5: only add iter-0 snapshot on fresh start (not resume)
+    if not args.resume:
+        league.add_snapshot(agent_net, iteration=0, save_dir=cfg.logging.league_dir)
 
-    rolling_rewards = []
-    rolling_lengths = []
+    # B8: use deque with maxlen instead of unbounded list
+    rolling_rewards = deque(maxlen=1000)
+    rolling_lengths = deque(maxlen=1000)
 
     # ==================================================================
     # MASTER TRAINING LOOP
@@ -152,7 +159,7 @@ def main(cfg: Optional[TrainingConfig] = None):
         opp_category, active_archetype = league.sample_matchup()
         opp_net, opp_pool_idx = league.get_opponent_model(agent_net, opp_category)
 
-        # FIX: Reset opponent hidden state when opponent changes
+        # Reset opponent hidden state when opponent changes
         opp_hidden = torch.zeros(1, cfg.env.num_envs,
                                  cfg.model.core_gru_dim, device=device)
 
@@ -173,15 +180,10 @@ def main(cfg: Optional[TrainingConfig] = None):
                 "winners": -np.ones(cfg.env.num_envs, dtype=np.int8),
                 "turn_counts": np.zeros(cfg.env.num_envs, dtype=np.int32)
             }
-            game_outcomes = []  # (winner, turn_count) for league tracking
-            next_obs_np = obs_np
-            next_mask_np = mask_np
-            next_hist_np = hist_np
+            game_outcomes = []
 
             # ==========================================================
             # 1a. RESOLVE OPPONENT TURNS BEFORE AGENT ACTS
-            #     (handles games where opponent starts first due to
-            #      randomized starting player)
             # ==========================================================
             opp_safety = 0
             while np.any(env.current_player == 1) and opp_safety < 500:
@@ -191,38 +193,46 @@ def main(cfg: Optional[TrainingConfig] = None):
                 opp_actions = np.zeros(cfg.env.num_envs, dtype=np.int64)
 
                 if opp_category == "archetype" and active_archetype is not None:
+                    # T5: only build mask (archetypes don't need obs/history for forward)
+                    fwd_mask = env.get_action_masks()
                     for e in opp_env_indices:
                         opp_actions[e] = HeuristicArchetypes.get_action(
-                            active_archetype, env, e, 1, next_mask_np[e]
+                            active_archetype, env, e, 1, fwd_mask[e]
                         )
                 else:
-                    idx_t = torch.from_numpy(opp_env_indices).to(device, non_blocking=True)
-                    n_opp = len(opp_env_indices)
-                    opp_obs_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_obs_np[opp_env_indices]))
-                    opp_mask_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_mask_np[opp_env_indices]))
-                    opp_hist_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_hist_np[opp_env_indices]))
-                    opp_obs_t = opp_obs_pinned[:n_opp].to(device, non_blocking=True)
-                    opp_mask_t = opp_mask_pinned[:n_opp].to(device, non_blocking=True)
-                    opp_hist_t = opp_hist_pinned[:n_opp].to(device, non_blocking=True)
-                    sub_hidden = opp_hidden[:, idx_t, :]
+                    # T5: build all three manually (not inside env.step)
+                    fwd_obs = env.get_observations()
+                    fwd_mask = env.get_action_masks()
+                    fwd_hist = env._get_histories()
+
+                    # T2: always forward the FULL num_envs batch (fixed shape, no recompiles)
+                    opp_obs_pinned.copy_(torch.from_numpy(fwd_obs))
+                    opp_mask_pinned.copy_(torch.from_numpy(fwd_mask))
+                    opp_hist_pinned.copy_(torch.from_numpy(fwd_hist))
+                    opp_obs_t = opp_obs_pinned.to(device, non_blocking=True)
+                    opp_mask_t = opp_mask_pinned.to(device, non_blocking=True)
+                    opp_hist_t = opp_hist_pinned.to(device, non_blocking=True)
 
                     with torch.no_grad():
-                        dist_opp, _, sub_hidden_new = opp_net(
+                        dist_opp, _, opp_hidden_full = opp_net(
                             obs=opp_obs_t, mask=opp_mask_t,
-                            history=opp_hist_t, hidden_state=sub_hidden
+                            history=opp_hist_t, hidden_state=opp_hidden
                         )
-                        opp_act_pinned[:n_opp].copy_(dist_opp.sample().cpu())
-                        sampled_opp = opp_act_pinned[:n_opp].numpy()
-                        opp_hidden[:, idx_t, :] = sub_hidden_new
+                        opp_act = dist_opp.sample()
 
-                    for i, e in enumerate(opp_env_indices):
-                        opp_actions[e] = sampled_opp[i]
+                    # Write back hidden ONLY for envs that actually moved
+                    idx_t = torch.from_numpy(opp_env_indices).to(device, non_blocking=True)
+                    opp_hidden[:, idx_t, :] = opp_hidden_full[:, idx_t, :]
 
-                next_obs_np, next_mask_np, next_hist_np, opp_rewards, opp_dones, opp_infos = env.step(
-                    opp_actions, env_mask=active_opp_mask
+                    # T4: async D2H to pinned memory + single sync
+                    opp_act_pinned.copy_(opp_act, non_blocking=True)
+                    torch.cuda.synchronize()
+                    sampled = opp_act_pinned.numpy()
+                    opp_actions[opp_env_indices] = sampled[opp_env_indices]
+
+                # T5: skip output building inside env.step
+                _, _, _, opp_rewards, opp_dones, opp_infos = env.step(
+                    opp_actions, env_mask=active_opp_mask, build_outputs=False
                 )
                 iter_env_steps += int(np.count_nonzero(active_opp_mask))
 
@@ -233,25 +243,24 @@ def main(cfg: Optional[TrainingConfig] = None):
                         step_infos[k] = np.where(
                             opp_dones, opp_infos[k], step_infos[k]
                         )
-                # Record outcomes for league
                 for e in range(cfg.env.num_envs):
                     if opp_dones[e]:
                         game_outcomes.append((
                             int(opp_infos["winners"][e]),
                             int(opp_infos["turn_counts"][e])
                         ))
-                # Reset opp_hidden for done envs (auto-reset means new game)
                 opp_done_t = torch.from_numpy(opp_dones).to(
                     device, non_blocking=True
                 ).float().view(1, -1, 1)
                 opp_hidden = opp_hidden * (1.0 - opp_done_t)
 
             # ==========================================================
-            # 1b. UPDATE OBSERVATIONS FOR AGENT
+            # 1b. BUILD OBSERVATIONS FOR AGENT
+            #     (T5: build manually after opponent loop, not inside env.step)
             # ==========================================================
-            obs_np = next_obs_np
-            mask_np = next_mask_np
-            hist_np = next_hist_np
+            obs_np = env.get_observations()
+            mask_np = env.get_action_masks()
+            hist_np = env._get_histories()
             obs_pinned.copy_(torch.from_numpy(obs_np))
             mask_pinned.copy_(torch.from_numpy(mask_np))
             hist_pinned.copy_(torch.from_numpy(hist_np))
@@ -259,8 +268,8 @@ def main(cfg: Optional[TrainingConfig] = None):
             mask_t = mask_pinned.to(device, non_blocking=True)
             hist_t = hist_pinned.to(device, non_blocking=True)
 
-            # FIX: Reset agent_hidden for envs where games ended during
-            #      pre-agent opponent resolution (auto-reset means new game)
+            # Reset agent_hidden for envs where games ended during
+            # pre-agent opponent resolution
             pre_agent_done_t = torch.from_numpy(step_dones).to(
                 device, non_blocking=True
             ).float().view(1, -1, 1)
@@ -277,18 +286,18 @@ def main(cfg: Optional[TrainingConfig] = None):
                 act_main = dist_main.sample()
                 logp_main = dist_main.log_prob(act_main)
 
-            act_pinned.copy_(act_main.cpu())
+            # T4: async D2H to pinned memory + single sync (was: .cpu() sync + double copy)
+            act_pinned.copy_(act_main, non_blocking=True)
+            torch.cuda.synchronize()
             act_main_np = act_pinned.numpy()
 
             # Step ONLY envs where it's the agent's turn
             agent_active = (~step_dones) & (env.current_player == 0)
             if np.any(agent_active):
-                agent_obs, agent_masks, agent_hists, agent_rewards, agent_dones, agent_infos = env.step(
-                    act_main_np, env_mask=agent_active
+                # T5: skip output building (loop 1d or post-loop will build manually)
+                _, _, _, agent_rewards, agent_dones, agent_infos = env.step(
+                    act_main_np, env_mask=agent_active, build_outputs=False
                 )
-                next_obs_np = agent_obs
-                next_mask_np = agent_masks
-                next_hist_np = agent_hists
                 iter_env_steps += int(np.count_nonzero(agent_active))
                 step_rewards = step_rewards + agent_rewards
                 step_dones = step_dones | agent_dones
@@ -313,38 +322,44 @@ def main(cfg: Optional[TrainingConfig] = None):
                 opp_actions = np.zeros(cfg.env.num_envs, dtype=np.int64)
 
                 if opp_category == "archetype" and active_archetype is not None:
+                    # T5: only build mask
+                    fwd_mask = env.get_action_masks()
                     for e in opp_env_indices:
                         opp_actions[e] = HeuristicArchetypes.get_action(
-                            active_archetype, env, e, 1, next_mask_np[e]
+                            active_archetype, env, e, 1, fwd_mask[e]
                         )
                 else:
-                    idx_t = torch.from_numpy(opp_env_indices).to(device, non_blocking=True)
-                    n_opp = len(opp_env_indices)
-                    opp_obs_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_obs_np[opp_env_indices]))
-                    opp_mask_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_mask_np[opp_env_indices]))
-                    opp_hist_pinned[:n_opp].copy_(
-                        torch.from_numpy(next_hist_np[opp_env_indices]))
-                    opp_obs_t = opp_obs_pinned[:n_opp].to(device, non_blocking=True)
-                    opp_mask_t = opp_mask_pinned[:n_opp].to(device, non_blocking=True)
-                    opp_hist_t = opp_hist_pinned[:n_opp].to(device, non_blocking=True)
-                    sub_hidden = opp_hidden[:, idx_t, :]
+                    # T5: build all three manually
+                    fwd_obs = env.get_observations()
+                    fwd_mask = env.get_action_masks()
+                    fwd_hist = env._get_histories()
+
+                    # T2: full-batch forward
+                    opp_obs_pinned.copy_(torch.from_numpy(fwd_obs))
+                    opp_mask_pinned.copy_(torch.from_numpy(fwd_mask))
+                    opp_hist_pinned.copy_(torch.from_numpy(fwd_hist))
+                    opp_obs_t = opp_obs_pinned.to(device, non_blocking=True)
+                    opp_mask_t = opp_mask_pinned.to(device, non_blocking=True)
+                    opp_hist_t = opp_hist_pinned.to(device, non_blocking=True)
 
                     with torch.no_grad():
-                        dist_opp, _, sub_hidden_new = opp_net(
+                        dist_opp, _, opp_hidden_full = opp_net(
                             obs=opp_obs_t, mask=opp_mask_t,
-                            history=opp_hist_t, hidden_state=sub_hidden
+                            history=opp_hist_t, hidden_state=opp_hidden
                         )
-                        opp_act_pinned[:n_opp].copy_(dist_opp.sample().cpu())
-                        sampled_opp = opp_act_pinned[:n_opp].numpy()
-                        opp_hidden[:, idx_t, :] = sub_hidden_new
+                        opp_act = dist_opp.sample()
 
-                    for i, e in enumerate(opp_env_indices):
-                        opp_actions[e] = sampled_opp[i]
+                    idx_t = torch.from_numpy(opp_env_indices).to(device, non_blocking=True)
+                    opp_hidden[:, idx_t, :] = opp_hidden_full[:, idx_t, :]
 
-                next_obs_np, next_mask_np, next_hist_np, opp_rewards, opp_dones, opp_infos = env.step(
-                    opp_actions, env_mask=active_opp_mask
+                    opp_act_pinned.copy_(opp_act, non_blocking=True)
+                    torch.cuda.synchronize()
+                    sampled = opp_act_pinned.numpy()
+                    opp_actions[opp_env_indices] = sampled[opp_env_indices]
+
+                # T5: skip output building
+                _, _, _, opp_rewards, opp_dones, opp_infos = env.step(
+                    opp_actions, env_mask=active_opp_mask, build_outputs=False
                 )
                 iter_env_steps += int(np.count_nonzero(active_opp_mask))
 
@@ -382,13 +397,13 @@ def main(cfg: Optional[TrainingConfig] = None):
 
             # ==========================================================
             # 1f. STORE TRANSITION IN BUFFER
+            #     (T5: build outputs manually for next step)
             # ==========================================================
-            rewards_t = torch.from_numpy(step_rewards).to(
-                device, dtype=torch.float32, non_blocking=True
-            )
-            dones_t = torch.from_numpy(step_dones).to(
-                device, dtype=torch.bool, non_blocking=True
-            )
+            # T4: use pinned buffers for truly async H2D
+            reward_pinned.copy_(torch.from_numpy(step_rewards))
+            done_pinned.copy_(torch.from_numpy(step_dones))
+            rewards_t = reward_pinned.to(device, non_blocking=True)
+            dones_t = done_pinned.to(device, non_blocking=True)
 
             buffer.insert(
                 obs=obs_t, mask=mask_t, history=hist_t,
@@ -402,7 +417,11 @@ def main(cfg: Optional[TrainingConfig] = None):
             agent_hidden = next_agent_hidden * (1.0 - done_mask)
             opp_hidden = opp_hidden * (1.0 - done_mask)
 
-            # Advance observations
+            # T5: build outputs for the next outer step
+            next_obs_np = env.get_observations()
+            next_mask_np = env.get_action_masks()
+            next_hist_np = env._get_histories()
+
             obs_np = next_obs_np
             mask_np = next_mask_np
             hist_np = next_hist_np
@@ -460,9 +479,9 @@ def main(cfg: Optional[TrainingConfig] = None):
 
         if iteration % cfg.logging.log_interval_iterations == 0:
             league_stats = league.get_stats()
-            mean_reward = (float(np.mean(rolling_rewards[-200:]))
+            mean_reward = (float(np.mean(rolling_rewards))
                            if len(rolling_rewards) > 0 else 0.0)
-            mean_len = (float(np.mean(rolling_lengths[-200:]))
+            mean_len = (float(np.mean(rolling_lengths))
                         if len(rolling_lengths) > 0 else 0.0)
 
             writer.add_scalar("Performance/FPS", fps, total_timesteps)

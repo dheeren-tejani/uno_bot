@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple
 import os
 import numpy as np
 import torch
+import random as py_random
 
 from config import LeagueConfig, ModelConfig, HardwareConfig
 from models import MaskedRecurrentActorCritic
@@ -33,38 +34,44 @@ class HeuristicArchetypes:
 
     @staticmethod
     def get_action(archetype: str, env, env_idx: int, player_idx: int, mask: np.ndarray) -> int:
-        legal = np.where(mask)[0]
+        """
+        T6 FIX: convert to Python ints once, then use pure-Python logic.
+        Avoids numpy scalar overhead (~5-10x faster per decision).
+        """
+        legal = np.flatnonzero(mask).tolist()        # Python list[int]
         if len(legal) == 1:
-            return int(legal[0])
+            return legal[0]
 
-        hand = env.hands[env_idx, player_idx]
+        hand_np = env.hands[env_idx, player_idx]
+        hand = hand_np.tolist()                       # Python list[int]
         color_counts = [sum(hand[c * 13:(c + 1) * 13]) for c in range(4)]
-        best_color = int(np.argmax(color_counts))
-        phase = env.current_phase[env_idx]
+        best_color = max(range(4), key=lambda c: color_counts[c])
+        phase = int(env.current_phase[env_idx])
+        legal_set = set(legal)                        # O(1) membership check
 
         # Post-draw phase handling
         if phase == 1:
-            if archetype == "hoarder" and np.random.rand() < 0.30:
+            if archetype == "hoarder" and py_random.random() < 0.30:
                 return 61  # Pass and keep drawn card
             # Play drawn card if available
             playable = [a for a in legal if a != 61]
-            return int(playable[0]) if len(playable) > 0 else 61
+            return playable[0] if playable else 61
 
         # Main Phase: Archetype-specific decision trees
         if archetype == "aggro":
             # Priority: +4 -> +2 -> Skip/Reverse -> Match dominant color -> Any legal
             for act in [56 + best_color, 56, 57, 58, 59]:
-                if act in legal: return act
+                if act in legal_set: return act
             for c in range(4):
                 act = c * 13 + 12
-                if act in legal: return act
+                if act in legal_set: return act
             for c in range(4):
                 for t in [10, 11]:
                     act = c * 13 + t
-                    if act in legal: return act
+                    if act in legal_set: return act
             for act in legal:
                 if act < 52 and (act // 13) == best_color: return act
-            return int(legal[0])
+            return legal[0]
 
         elif archetype == "hoarder":
             # Priority: Numbers (0-9) -> Skips/Reverses -> Wilds/Draws only when forced -> Draw (60)
@@ -73,26 +80,26 @@ class HeuristicArchetypes:
             for c in range(4):
                 for t in [10, 11]:
                     act = c * 13 + t
-                    if act in legal: return act
-            if 60 in legal:
+                    if act in legal_set: return act
+            if 60 in legal_set:
                 return 60
-            return int(legal[0])
+            return legal[0]
 
         elif archetype == "color_manipulator":
             # Forces active color into dominant hand color relentlessly
             for act in [52 + best_color, 56 + best_color]:
-                if act in legal: return act
+                if act in legal_set: return act
             for act in legal:
                 if act < 52 and (act // 13) == best_color: return act
-            return int(legal[0])
+            return legal[0]
 
         elif archetype == "erratic":
             # Simulates casual, noisy human play
-            if np.random.rand() < 0.25:
-                return int(np.random.choice(legal))
-            return int(legal[0])
+            if py_random.random() < 0.25:
+                return py_random.choice(legal)
+            return legal[0]
 
-        return int(legal[0])
+        return legal[0]
 
 
 class LeagueManager:
@@ -216,20 +223,17 @@ class LeagueManager:
         self.current_cycle_games += 1
         if winner == 0:
             self.current_cycle_wins += 1
-            self.update_elo(1.0, opp_pool_idx)
+            self.update_elo(1.0, opp_pool_idx, arch_name)
         elif winner == 1:
-            self.update_elo(0.0, opp_pool_idx)
+            self.update_elo(0.0, opp_pool_idx, arch_name)
             if arch_name is not None and arch_name in self.archetype_stats:
                 self.archetype_stats[arch_name]["wins"] += 1
         else:
-            self.update_elo(0.5, opp_pool_idx)
-
+            self.update_elo(0.5, opp_pool_idx, arch_name)
         if arch_name is not None and arch_name in self.archetype_stats:
             self.archetype_stats[arch_name]["games"] += 1
 
     def should_save_snapshot(self, total_games: int) -> bool:
-        # Interval trigger uses a tracked counter (exact-multiple modulo checks
-        # silently skip triggers when game completions arrive in uneven jumps).
         if total_games - self.last_snapshot_games >= self.cfg.snapshot_interval_games:
             return True
         if self.current_cycle_games >= 1500:
@@ -241,9 +245,6 @@ class LeagueManager:
     def restore_pool_from_disk(self, league_dir: str) -> int:
         """
         Rebuilds the matchmaking pool from previously saved league checkpoints.
-        Used on --resume so Ctrl+C/restart does not empty the PFSP opposition.
-        Files are never deleted here; if more than max_league_capacity exist,
-        only the strongest are kept in the roster (all stay on disk).
         Returns the number of opponents restored.
         """
         if not os.path.isdir(league_dir):
@@ -302,7 +303,7 @@ class LeagueManager:
                     os.remove(removed.model_path)
                 except OSError:
                     pass
-        
+
         self.last_snapshot_games = total_games
         self.current_cycle_games = 0
         self.current_cycle_wins = 0

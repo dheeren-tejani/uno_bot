@@ -39,7 +39,7 @@ class UnoCardFormatter:
             return "[bold magenta]WILD[/bold magenta]"
         elif card_id == 53:
             return "[bold magenta]WILD +4[/bold magenta]"
-        
+
         color_idx = card_id // 13
         card_type = card_id % 13
         color_str = cls.COLOR_NAMES[color_idx]
@@ -106,11 +106,9 @@ def load_trained_agent(model_path: str, cfg: TrainingConfig) -> MaskedRecurrentA
 def run_benchmark(model_path: str, num_games: int = 2000, stochastic: bool = False):
     """
     Evaluates the trained model against Random and all Heuristic Archetypes.
-    Defaults to greedy (argmax) action selection for a true strength measurement;
-    pass stochastic=True for sampling-based parity checks.
     """
     cfg = TrainingConfig()
-    cfg.env.num_envs = 1  # Single environment stream for evaluation tracking
+    cfg.env.num_envs = 1
     env = VectorizedUnoEnv(env_cfg=cfg.env, card_cfg=cfg.cards, seed=int(time.time()))
     agent = load_trained_agent(model_path, cfg)
 
@@ -137,7 +135,7 @@ def run_benchmark(model_path: str, num_games: int = 2000, stochastic: bool = Fal
         console.print(f"\n[bold yellow]Starting Benchmark vs {opp_label}...[/bold yellow]")
 
         for g in range(num_games):
-            agent_seat = g % 2   # alternate seats to cancel first-mover advantage
+            agent_seat = g % 2
             obs, mask, hist = env.reset()
             hidden = torch.zeros(1, 1, cfg.model.core_gru_dim, device=cfg.hardware.device)
             done = False
@@ -145,7 +143,6 @@ def run_benchmark(model_path: str, num_games: int = 2000, stochastic: bool = Fal
             while not done:
                 p = int(env.current_player[0])
                 if p == agent_seat:
-                    # Model Turn
                     obs_t = torch.from_numpy(obs).to(cfg.hardware.device)
                     mask_t = torch.from_numpy(mask).to(cfg.hardware.device)
                     hist_t = torch.from_numpy(hist).to(cfg.hardware.device)
@@ -154,7 +151,6 @@ def run_benchmark(model_path: str, num_games: int = 2000, stochastic: bool = Fal
                         dist, _, hidden = agent(obs=obs_t, mask=mask_t, history=hist_t, hidden_state=hidden)
                         action = pick_action(dist, greedy=not stochastic).cpu().numpy()[0]
                 else:
-                    # Baseline Turn
                     if opp_type == "random":
                         legal = np.where(mask[0])[0]
                         action = int(np.random.choice(legal))
@@ -174,7 +170,7 @@ def run_benchmark(model_path: str, num_games: int = 2000, stochastic: bool = Fal
 
         win_rate = (wins / num_games) * 100
         avg_len = float(np.mean(total_turns)) if len(total_turns) > 0 else 0.0
-        
+
         summary_table.add_row(
             opp_label,
             f"{win_rate:.2f}%",
@@ -196,12 +192,11 @@ def run_mcts_benchmark(
 ):
     """
     The definitive strength measurement: trained agent (greedy) vs ISMCTS.
-    Seats alternate every game to cancel first-mover advantage. Score uses
-    win=1, draw=0.5. Reports binomial 95% confidence intervals.
     """
     cfg = TrainingConfig()
     cfg.env.num_envs = 1
-    env = VectorizedUnoEnv(env_cfg=cfg.env, card_cfg=cfg.cards, seed=67)
+    # B9 FIX: use the seed parameter (was hardcoded seed=67)
+    env = VectorizedUnoEnv(env_cfg=cfg.env, card_cfg=cfg.cards, seed=seed)
     agent = load_trained_agent(model_path, cfg)
     rng = random.Random(seed)
 
@@ -217,7 +212,6 @@ def run_mcts_benchmark(
         wins = draws = losses = 0
         total_turns: List[int] = []
 
-        # NEW: Rich Progress Bar Setup
         with Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(bar_width=40),
@@ -228,7 +222,7 @@ def run_mcts_benchmark(
             console=console,
         ) as progress:
             mcts_task = progress.add_task(f"Playing vs ISMCTS ({sims} sims/move)", total=num_games, score=0.0)
-            
+
             for g in range(num_games):
                 agent_seat = g % 2
                 obs, mask, hist = env.reset()
@@ -249,7 +243,6 @@ def run_mcts_benchmark(
                         action = ismcts_select_action(
                             st, simulations=sims, rng=rng, playout_depth=playout_depth
                         )
-                        # --- DEBUG BLOCK ---
                         if not mask[0][action]:
                             console.print("\n[bold red]--- DEBUG: ILLEGAL ACTION DETECTED ---[/bold red]")
                             console.print(f"Action Chosen: {action} ({UnoCardFormatter.format_action(action)})")
@@ -259,8 +252,7 @@ def run_mcts_benchmark(
                             console.print(f"Engine Legal: {np.where(mask[0])[0]}")
                             console.print(f"MCTS Draw Pile Len: {len(st.draw_pile)}")
                             raise AssertionError("search chose an illegal action")
-                        # -------------------
-    
+
                     obs, mask, hist, _, dones, infos = env.step(np.array([action]))
                     done = dones[0]
 
@@ -275,7 +267,6 @@ def run_mcts_benchmark(
                 else:
                     losses += 1
 
-                # NEW: Update the progress bar and running score
                 p_hat = score / (g + 1)
                 progress.update(mcts_task, advance=1, score=p_hat)
 
@@ -297,7 +288,6 @@ def run_mcts_benchmark(
 def run_interactive(model_path: str, greedy: bool = False):
     """
     Interactive CLI human player (Player 0) vs. Trained Bot (Player 1).
-    Pass greedy=True for deterministic bot play instead of sampling.
     """
     cfg = TrainingConfig()
     cfg.env.num_envs = 1
@@ -332,8 +322,6 @@ def run_interactive(model_path: str, greedy: bool = False):
 
         if p == 0:
             # Human Turn
-            
-            # --- NEW: Print the human's full hand ---
             hand_counts = env.hands[0, 0]
             hand_cards = []
             for card_id, count in enumerate(hand_counts):
@@ -341,8 +329,7 @@ def run_interactive(model_path: str, greedy: bool = False):
                     for _ in range(int(count)):
                         hand_cards.append(UnoCardFormatter.format_card(card_id))
             console.print(f"\n[bold green]Your Hand:[/bold green] {', '.join(hand_cards)}")
-            
-            # Print legal choices
+
             legal_indices = np.where(mask[0])[0]
             console.print("[bold]Legal Available Choices:[/bold]")
             for idx, act in enumerate(legal_indices):

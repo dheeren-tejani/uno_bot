@@ -2,7 +2,7 @@ uno/
 venv/
 env
 __pycache__/
-checkpoints/
+train_checkpoints/
 interactive_game_logs/
-kimi_chat.py
-modal_app.py
+backend/replays/*
+.env
