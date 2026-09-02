@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: uno-duel-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: UNO_TRUST_PROXY
+        value: "true"
+      - key: UNO_TORCH_THREADS
+        value: "1"
+      - key: UNO_ALLOWED_ORIGINS
+        sync: false
