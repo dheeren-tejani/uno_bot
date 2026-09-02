@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
         log.info("bot[%s] → %s", d, rlbot.bot_mode(d))
     log.info("replay codes: %d chars | R2: %s | disk: %s",
              replay_store.CODE_LEN, settings.r2_enabled, settings.data_dir or "off")
+    log.info("CORS origins: %s", settings.origins)
     start_sweeper(sessions)
     yield
 
@@ -134,6 +135,7 @@ def health() -> dict:
             "training_modules": rlbot.modules_status(),
             "modes": {d: rlbot.bot_mode(d) for d in ("easy", "normal", "hard")},
             "active_sessions": sessions.count(),
+            "cors_origins": settings.origins,
             "replay_code_length": replay_store.CODE_LEN}
 
 
