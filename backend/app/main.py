@@ -130,8 +130,11 @@ def get_replay(code: str) -> dict:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True,
-            "active_sessions": sessions.count()}
+    return {"ok": True, "torch": rlbot.TORCH_OK,
+            "training_modules": rlbot.modules_status(),
+            "modes": {d: rlbot.bot_mode(d) for d in ("easy", "normal", "hard")},
+            "active_sessions": sessions.count(),
+            "replay_code_length": replay_store.CODE_LEN}
 
 
 @app.exception_handler(Exception)
