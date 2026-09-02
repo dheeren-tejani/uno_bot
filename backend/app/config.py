@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Serving
-    allow_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    allow_origins: str = "http://localhost:5173,http://127.0.0.1:5173,https://uno-bot.netlify.app"
     static_dir: str = ""
     allow_origins_regex: str = ""
 

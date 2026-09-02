@@ -15,4 +15,4 @@ services:
       - key: UNO_TORCH_THREADS
         value: "1"
       - key: UNO_ALLOWED_ORIGINS
-        sync: false
+        value: https://uno-bot.netlify.app
